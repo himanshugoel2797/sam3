@@ -30,6 +30,8 @@ from PIL import Image
 from scipy import ndimage as ndi
 from pycocotools import mask as mask_utils
 
+from joint_mask import build_joint_labels
+
 
 # ---------------------------------------------------------------------------
 # Tunables
@@ -39,14 +41,23 @@ ALIGNED_DIR = Path('aligned')
 XRF_CHANNELS = ['Ge_K_fista', 'Te_L_fista', 'Ti_K_fista', 'W_L_fista']
 OUT_DIR = Path('sam3_export')
 
-MASK_PERCENTILE = 95.0   # user-validated threshold
+MASK_PERCENTILE = 95.0   # user-validated XRF threshold
 MIN_COMPONENT_VOXELS = 100
-CONNECTIVITY = np.ones((3, 3, 3), dtype=np.uint8)   # 26-connectivity
 # Morphological closing fills tiny gaps from XRF-blur before CC labeling so
 # fragments of the same physical feature aren't split into separate instances.
 # Validated via relabel_sweep.py: iters=1 absorbs ~7 noise fragments without
 # merging semantically distinct regions; iters>=3 collapses real structure.
 MASK_CLOSING_ITERS = 1
+
+# Joint XRF ∩ ptycho thresholding: XRF selects where metal is present; ptycho
+# selects where density is above background. Intersecting snaps boundaries to
+# the crisp ptycho edges and drops XRF-only regions (no visible ptycho signal
+# → model can't learn them). Validated via joint_threshold_sweep.py: P85 on
+# ptycho preserves enough structure to avoid fragmenting traces while trimming
+# ~40% of fg voxels that the model was being penalized for.
+PTYCHO_METHOD = "percentile"
+PTYCHO_PERCENTILE = 85.0
+POST_CLOSING_ITERS = 1
 
 # Per-frame prompt sampling
 NUM_POS_POINTS = 5
@@ -79,28 +90,19 @@ def norm_to_uint8(a: np.ndarray) -> np.ndarray:
     return np.clip(255 * (a - lo) / max(hi - lo, 1e-12), 0, 255).astype(np.uint8)
 
 
-def build_instance_labels(aligned_xrf: np.ndarray) -> np.ndarray:
-    """Threshold each aligned channel at its P95, OR into a union mask,
-    drop tiny components, then label the 3D volume with stable instance IDs."""
-    def norm01(a):
-        lo, hi = np.percentile(a, (1, 99.9))
-        return np.clip((a - lo) / max(hi - lo, 1e-12), 0, 1).astype(np.float32)
-
-    chans = np.stack([norm01(c) for c in aligned_xrf])
-    thr = np.array([np.percentile(c, MASK_PERCENTILE) for c in chans])
-    mask = (chans > thr[:, None, None, None]).any(axis=0)
-
-    if MASK_CLOSING_ITERS > 0:
-        mask = ndi.binary_closing(mask, iterations=MASK_CLOSING_ITERS)
-
-    lbl, _ = ndi.label(mask, structure=CONNECTIVITY)
-    sizes = np.bincount(lbl.ravel())
-    keep = sizes >= MIN_COMPONENT_VOXELS
-    keep[0] = False
-    # remap labels to a contiguous range starting at 1
-    remap = np.zeros_like(sizes)
-    remap[keep] = np.arange(1, keep.sum() + 1)
-    return remap[lbl].astype(np.int32)
+def build_instance_labels(
+    aligned_xrf: np.ndarray, ptycho: np.ndarray
+) -> tuple[np.ndarray, dict]:
+    """Joint XRF ∩ ptycho instance labels — see joint_mask.build_joint_labels."""
+    return build_joint_labels(
+        aligned_xrf, ptycho,
+        xrf_percentile=MASK_PERCENTILE,
+        xrf_closing_iters=MASK_CLOSING_ITERS,
+        ptycho_method=PTYCHO_METHOD,
+        ptycho_percentile=PTYCHO_PERCENTILE,
+        post_closing_iters=POST_CLOSING_ITERS,
+        min_component_voxels=MIN_COMPONENT_VOXELS,
+    )
 
 
 def sample_points(slice_mask: np.ndarray, rng: np.random.Generator) -> dict:
@@ -150,18 +152,24 @@ def export() -> None:
     ptycho, aligned_xrf = load_volumes()
     print(f'ptycho  {ptycho.shape}  |  xrf stack  {aligned_xrf.shape}')
 
-    labels3d = build_instance_labels(aligned_xrf)
+    labels3d, label_info = build_instance_labels(aligned_xrf, ptycho)
     n_instances = int(labels3d.max())
     assert n_instances <= 255, f'{n_instances} instances → switch mask dtype to uint16'
-    print(f'3D instances: {n_instances}  (stable IDs across all slices)')
+    print(
+        f'3D instances: {n_instances}  (stable IDs across all slices)  '
+        f'fg%={label_info["final_fg_pct"]:.2f}  '
+        f'pty_thr={label_info["ptycho_threshold"]:.5f}'
+    )
 
     ptycho_u8 = norm_to_uint8(ptycho)
 
     coco = {
         'info': {
-            'description': 'Ptycho-tomo + XRF-derived union mask (aligned)',
+            'description': 'Ptycho-tomo + joint XRF∩ptycho mask (aligned)',
             'source_volume': REF_VOLUME,
-            'mask_percentile': MASK_PERCENTILE,
+            'xrf_percentile': MASK_PERCENTILE,
+            'ptycho_method': PTYCHO_METHOD,
+            'ptycho_percentile': PTYCHO_PERCENTILE,
             'num_3d_instances': n_instances,
         },
         'categories': [{'id': 1, 'name': 'IC feature', 'supercategory': 'integrated_circuit'}],
@@ -246,6 +254,10 @@ def export() -> None:
         'mask_percentile': MASK_PERCENTILE,
         'mask_closing_iters': MASK_CLOSING_ITERS,
         'min_component_voxels': MIN_COMPONENT_VOXELS,
+        'ptycho_method': PTYCHO_METHOD,
+        'ptycho_percentile': PTYCHO_PERCENTILE,
+        'post_closing_iters': POST_CLOSING_ITERS,
+        'label_info': label_info,
         'ptycho_shape_zyx': list(ptycho.shape),
         'normalization': {'lo_pct': NORM_LO_PCT, 'hi_pct': NORM_HI_PCT, 'output': 'uint8 RGB JPEG'},
         'mask_format': 'uint8 PNG; pixel value = 3D instance ID (0 = background)',
@@ -253,8 +265,10 @@ def export() -> None:
             'Instance IDs are stable across frames within a video (same 3D component).',
             'IDs are NOT stable across videos (xy / xz / yz share underlying 3D labels '
             'but the instance set visible in each slice differs).',
-            'Prompts were sampled from the XRF-derived mask and inherit its ~1.6x coarser '
-            'XY resolution — see README in project root.',
+            'Labels are XRF ∩ ptycho>P85 — boundaries follow the crisp ptycho edges '
+            'while XRF selects which density features are actual material. XRF-only '
+            'regions with no visible ptycho signal are dropped (validated via '
+            'joint_threshold_sweep.py).',
         ],
     }
     with open(OUT_DIR / 'meta.json', 'w') as f:
