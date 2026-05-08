@@ -605,6 +605,10 @@ class BinaryHungarianMatcherV2(nn.Module):
             + self.cost_class * cost_class
             + self.cost_giou * cost_giou
         )
+        # Replace NaN/Inf entries with a high cost so linear_sum_assignment
+        # won't crash.  This can happen when predicted boxes degenerate
+        # (zero area → NaN GIoU) or when focal-log terms hit log(0).
+        C = torch.nan_to_num(C, nan=1e9, posinf=1e9, neginf=-1e9)
         # assign a very high cost (1e9) to invalid outputs and targets, so that we can
         # filter them out (in `_do_matching`) from bipartite matching results
         do_filtering = out_is_valid is not None or target_is_valid_padded is not None

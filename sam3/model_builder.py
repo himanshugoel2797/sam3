@@ -525,21 +525,36 @@ def _create_sam3_transformer(has_presence_token: bool = True) -> TransformerWrap
 
 def _load_checkpoint(model, checkpoint_path):
     """Load model checkpoint from file."""
-    with g_pathmgr.open(checkpoint_path, "rb") as f:
-        ckpt = torch.load(f, map_location="cpu", weights_only=True)
+    if checkpoint_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        ckpt = load_file(checkpoint_path, device="cpu")
+    else:
+        with g_pathmgr.open(checkpoint_path, "rb") as f:
+            ckpt = torch.load(f, map_location="cpu", weights_only=False)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
-    if model.inst_interactive_predictor is not None:
-        sam3_image_ckpt.update(
-            {
-                k.replace("tracker.", "inst_interactive_predictor.model."): v
-                for k, v in ckpt.items()
-                if "tracker" in k
-            }
-        )
+    # Two on-disk formats are supported:
+    #   1. Released checkpoint (e.g. examples/sam3.pt): keys prefixed with
+    #      "detector." (image branch) and "tracker." (video branch).
+    #   2. Trainer-saved checkpoint (runs/*/checkpoints/checkpoint.pt): keys
+    #      already use the model's native names (backbone.*, transformer.*, ...).
+    has_detector_prefix = any(k.startswith("detector.") for k in ckpt.keys())
+    if has_detector_prefix:
+        sam3_image_ckpt = {
+            k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
+        }
+        if model.inst_interactive_predictor is not None:
+            sam3_image_ckpt.update(
+                {
+                    k.replace("tracker.", "inst_interactive_predictor.model."): v
+                    for k, v in ckpt.items()
+                    if "tracker" in k
+                }
+            )
+    else:
+        # Native-prefix checkpoint: pass through as-is.
+        sam3_image_ckpt = dict(ckpt)
     missing_keys, _ = model.load_state_dict(sam3_image_ckpt, strict=False)
     if len(missing_keys) > 0:
         print(
